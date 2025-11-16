@@ -1,0 +1,177 @@
+import base64
+import io
+import os
+from typing import Optional, List
+
+import requests
+import streamlit as st
+from PIL import Image
+
+st.set_page_config(page_title="Heritage Buzz Studio", layout="centered")
+
+st.title("🧵 Heritage Buzz – Style Studio")
+st.write(
+    "This lightweight Streamlit UI talks to the existing Flask style-transfer API so you can demo the GenAI pipeline without the React web app."
+)
+
+# Allow overriding the ML server location without touching code.
+def _default_backend_url() -> str:
+    return os.environ.get("HERITAGE_ML_URL", "http://localhost:5000")
+
+backend_url = st.sidebar.text_input("ML API base URL", value=_default_backend_url())
+st.sidebar.info(
+    "Run `python application.py` inside the ML folder first so the `/style_transfer` and `/generate_style` endpoints are available."
+)
+
+COLORMAP_OPTIONS = {
+    "Preserve original colors": "original",
+    "Jet heatmap": "jet",
+    "Cool heatmap": "cool",
+    "Ocean heatmap": "ocean",
+    "Rainbow heatmap": "rainbow",
+    "Summer heatmap": "summer",
+}
+
+iterations = st.sidebar.slider("Style iterations", min_value=20, max_value=300, value=40, step=10)
+colormap_label = st.sidebar.selectbox("Color treatment", list(COLORMAP_OPTIONS.keys()))
+colormap_value = COLORMAP_OPTIONS[colormap_label]
+st.sidebar.caption("Higher iterations run longer but produce richer textures.")
+color_blend = st.sidebar.slider(
+    "Styled vs garment blend",
+    min_value=0.0,
+    max_value=1.0,
+    value=0.7,
+    step=0.05,
+    help="1.0 = keep neural colors, 0.0 = original garment colors"
+)
+
+with st.sidebar.expander("Advanced loss weights", expanded=False):
+    style_weight_input = st.number_input(
+        "Style weight",
+        value=1e-6,
+        min_value=1e-9,
+        max_value=1e-3,
+        format="%.1e",
+        step=1e-7,
+    )
+    content_weight_input = st.number_input(
+        "Content weight",
+        value=2.5e-8,
+        min_value=1e-10,
+        max_value=1e-4,
+        format="%.1e",
+        step=1e-9,
+    )
+    tv_weight_input = st.number_input(
+        "Total variation weight",
+        value=1e-6,
+        min_value=1e-9,
+        max_value=1e-3,
+        format="%.1e",
+        step=1e-7,
+    )
+
+ARTFORMS = [
+    "Madhubani",
+    "Gond",
+    "Warli",
+    "Kalamkari",
+    "Pattachitra",
+]
+
+session_image: Optional[Image.Image] = None
+session_logs: Optional[List[str]] = None
+
+mode = st.radio("Choose a generation mode", ["Upload custom art", "Surprise me with an artform"], horizontal=True)
+
+if mode == "Upload custom art":
+    base_upload = st.file_uploader("Optional: upload a garment/clothing photo", type=["png", "jpg", "jpeg"], key="base_uploader")
+    design_upload = st.file_uploader("Upload a PNG/JPG heritage design", type=["png", "jpg", "jpeg"], key="design_uploader")
+    if st.button("Blend art onto garment", disabled=design_upload is None):
+        session_logs = None
+        with st.spinner("Calling /style_transfer …"):
+            files = {
+                "design": (design_upload.name, design_upload.getvalue(), design_upload.type or "image/png"),
+            }
+            if base_upload is not None:
+                files["base"] = (base_upload.name, base_upload.getvalue(), base_upload.type or "image/png")
+
+            try:
+                response = requests.post(
+                    f"{backend_url}/style_transfer",
+                    files=files,
+                    data={
+                        "iterations": str(iterations),
+                        "colormap": colormap_value,
+                        "return_logs": "true",
+                        "style_weight": f"{style_weight_input}",
+                        "content_weight": f"{content_weight_input}",
+                        "tv_weight": f"{tv_weight_input}",
+                        "color_blend": f"{color_blend}",
+                    },
+                    timeout=300,
+                )
+            except requests.exceptions.RequestException as exc:
+                st.error(f"Failed to reach ML server: {exc}")
+                response = None
+        if response and response.status_code == 200:
+            if "application/json" in response.headers.get("Content-Type", ""):
+                payload = response.json()
+                image_bytes = base64.b64decode(payload.get("image_base64", ""))
+                session_image = Image.open(io.BytesIO(image_bytes))
+                session_logs = payload.get("logs", []) or None
+            else:
+                session_image = Image.open(io.BytesIO(response.content))
+                session_logs = None
+        elif response is not None:
+            st.error(f"ML server error {response.status_code}: {response.text}")
+else:
+    artform = st.selectbox("Pick a heritage artform", ARTFORMS)
+    if st.button("Generate with artform"):
+        session_logs = None
+        with st.spinner("Calling /generate_style …"):
+            try:
+                response = requests.post(
+                    f"{backend_url}/generate_style",
+                    json={
+                        "artform": artform,
+                        "iterations": iterations,
+                        "colormap": colormap_value,
+                        "return_logs": True,
+                        "style_weight": style_weight_input,
+                        "content_weight": content_weight_input,
+                        "tv_weight": tv_weight_input,
+                        "color_blend": color_blend,
+                    },
+                    timeout=300,
+                )
+            except requests.exceptions.RequestException as exc:
+                st.error(f"Failed to reach ML server: {exc}")
+                response = None
+        if response and response.status_code == 200:
+            if "application/json" in response.headers.get("Content-Type", ""):
+                payload = response.json()
+                image_bytes = base64.b64decode(payload.get("image_base64", ""))
+                session_image = Image.open(io.BytesIO(image_bytes))
+                session_logs = payload.get("logs", []) or None
+            else:
+                session_image = Image.open(io.BytesIO(response.content))
+                session_logs = None
+        elif response is not None:
+            st.error(f"ML server error {response.status_code}: {response.text}")
+
+if session_image:
+    st.success("Here is your GenAI garment!")
+    st.image(session_image, caption="Streamlit preview", use_column_width=True)
+    buf = io.BytesIO()
+    session_image.save(buf, format="PNG")
+    st.download_button(
+        "Download PNG",
+        data=buf.getvalue(),
+        file_name="heritage_style.png",
+        mime="image/png",
+    )
+
+if session_logs:
+    st.subheader("Generation Logs")
+    st.code("\n".join(session_logs))

@@ -1,0 +1,6 @@
+designs/
+venv/
+.env/
+.env.local
+.env.*.local
+__pycache__/

@@ -1,0 +1,6 @@
+tensorflow
+flask
+rembg
+numpy
+flask-cors
+onnxruntime-gpu
