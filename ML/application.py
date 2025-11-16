@@ -412,4 +412,8 @@ def generate_style():
     return send_file(output_img, mimetype='image/png')
 
 if __name__ == '__main__':
-    app.run()
+    host = os.getenv("HB_HOST", "0.0.0.0")
+    port = int(os.getenv("HB_PORT", "5000"))
+    threaded = _as_bool(os.getenv("HB_THREADED", "true"))
+    # Threaded server keeps the /progress endpoint responsive while NST work is running.
+    app.run(host=host, port=port, threaded=threaded)
