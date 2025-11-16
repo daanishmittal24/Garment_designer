@@ -1,4 +1,4 @@
-# AI Clothing Designer · GenAI Lab
+# AI Clothing Designer 
 
 - Single-purpose GenAI lab that stylizes garments with Indian heritage art using Python, TensorFlow, and Streamlit.
 - `ML/application.py` hosts the neural style-transfer + background removal pipeline with configurable loss weights and color blending.
