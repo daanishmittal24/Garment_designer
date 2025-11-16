@@ -1,4 +1,4 @@
-# AI Clothing Designer · GenAI Lab
+# AI Clothing Designer 
 
 AI Clothing Designer is a focused GenAI project that fuses heritage art motifs with modern garments. A TensorFlow-based neural style-transfer core blends textures and silhouettes, while a Streamlit front-end exposes every control needed for lab experiments, demos, or rapid iteration.
 
