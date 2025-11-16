@@ -1,6 +1,9 @@
 import base64
 import io
 import os
+import threading
+import time
+import uuid
 from typing import Optional, List
 
 import requests
@@ -22,6 +25,50 @@ backend_url = st.sidebar.text_input("ML API base URL", value=_default_backend_ur
 st.sidebar.info(
     "Run `python application.py` inside the ML folder first so the `/style_transfer` and `/generate_style` endpoints are available."
 )
+
+
+def execute_with_progress(request_callable, job_id: str, total_iterations: int):
+    progress_bar = st.progress(0.0)
+    status_placeholder = st.empty()
+    response_holder: dict[str, requests.Response] = {}
+    error_holder: dict[str, Exception] = {}
+
+    def _worker():
+        try:
+            response_holder['response'] = request_callable()
+        except Exception as exc:  # pylint: disable=broad-except
+            error_holder['error'] = exc
+
+    thread = threading.Thread(target=_worker, daemon=True)
+    thread.start()
+
+    while thread.is_alive():
+        try:
+            progress_resp = requests.get(f"{backend_url}/progress/{job_id}", timeout=5)
+            if progress_resp.status_code == 200:
+                payload = progress_resp.json()
+                total = payload.get('total') or total_iterations
+                current = payload.get('current') or 0
+                loss_value = payload.get('loss')
+                ratio = 0.0 if not total else min(max(current / total, 0.0), 1.0)
+                label = f"Iteration {current}/{total}"
+                if loss_value is not None:
+                    label += f" · loss {loss_value:.2f}"
+                status_placeholder.text(label)
+                progress_bar.progress(ratio)
+            else:
+                status_placeholder.text("Waiting for progress …")
+        except requests.exceptions.RequestException:
+            status_placeholder.text("Waiting for progress …")
+        time.sleep(0.8)
+
+    thread.join()
+    progress_bar.progress(1.0)
+    status_placeholder.text("Completed.")
+
+    if 'error' in error_holder:
+        raise error_holder['error']
+    return response_holder.get('response')
 
 COLORMAP_OPTIONS = {
     "Preserve original colors": "original",
@@ -89,31 +136,48 @@ if mode == "Upload custom art":
     design_upload = st.file_uploader("Upload a PNG/JPG heritage design", type=["png", "jpg", "jpeg"], key="design_uploader")
     if st.button("Blend art onto garment", disabled=design_upload is None):
         session_logs = None
-        with st.spinner("Calling /style_transfer …"):
-            files = {
-                "design": (design_upload.name, design_upload.getvalue(), design_upload.type or "image/png"),
-            }
-            if base_upload is not None:
-                files["base"] = (base_upload.name, base_upload.getvalue(), base_upload.type or "image/png")
+        design_bytes = design_upload.getvalue()
+        job_id = str(uuid.uuid4())
 
-            try:
-                response = requests.post(
-                    f"{backend_url}/style_transfer",
-                    files=files,
-                    data={
-                        "iterations": str(iterations),
-                        "colormap": colormap_value,
-                        "return_logs": "true",
-                        "style_weight": f"{style_weight_input}",
-                        "content_weight": f"{content_weight_input}",
-                        "tv_weight": f"{tv_weight_input}",
-                        "color_blend": f"{color_blend}",
-                    },
-                    timeout=300,
+        files = {
+            "design": (design_upload.name or "design.png", design_bytes, design_upload.type or "image/png"),
+        }
+        if base_upload is not None:
+            files["base"] = (
+                base_upload.name or "base.png",
+                base_upload.getvalue(),
+                base_upload.type or "image/png",
+            )
+
+        form_data = {
+            "iterations": str(iterations),
+            "colormap": colormap_value,
+            "return_logs": "true",
+            "style_weight": f"{style_weight_input}",
+            "content_weight": f"{content_weight_input}",
+            "tv_weight": f"{tv_weight_input}",
+            "color_blend": f"{color_blend}",
+            "request_id": job_id,
+        }
+
+        try:
+            with st.spinner("Generating garment …"):
+                response = execute_with_progress(
+                    lambda: requests.post(
+                        f"{backend_url}/style_transfer",
+                        files=files,
+                        data=form_data,
+                        timeout=300,
+                    ),
+                    job_id,
+                    iterations,
                 )
-            except requests.exceptions.RequestException as exc:
-                st.error(f"Failed to reach ML server: {exc}")
-                response = None
+        except requests.exceptions.RequestException as exc:
+            st.error(f"Failed to reach ML server: {exc}")
+            response = None
+        except Exception as exc:  # pylint: disable=broad-except
+            st.error(f"Generation failed: {exc}")
+            response = None
         if response and response.status_code == 200:
             if "application/json" in response.headers.get("Content-Type", ""):
                 payload = response.json()
@@ -129,25 +193,36 @@ else:
     artform = st.selectbox("Pick a heritage artform", ARTFORMS)
     if st.button("Generate with artform"):
         session_logs = None
-        with st.spinner("Calling /generate_style …"):
-            try:
-                response = requests.post(
-                    f"{backend_url}/generate_style",
-                    json={
-                        "artform": artform,
-                        "iterations": iterations,
-                        "colormap": colormap_value,
-                        "return_logs": True,
-                        "style_weight": style_weight_input,
-                        "content_weight": content_weight_input,
-                        "tv_weight": tv_weight_input,
-                        "color_blend": color_blend,
-                    },
-                    timeout=300,
+        job_id = str(uuid.uuid4())
+        payload = {
+            "artform": artform,
+            "iterations": iterations,
+            "colormap": colormap_value,
+            "return_logs": True,
+            "style_weight": style_weight_input,
+            "content_weight": content_weight_input,
+            "tv_weight": tv_weight_input,
+            "color_blend": color_blend,
+            "request_id": job_id,
+        }
+
+        try:
+            with st.spinner("Generating garment …"):
+                response = execute_with_progress(
+                    lambda: requests.post(
+                        f"{backend_url}/generate_style",
+                        json=payload,
+                        timeout=300,
+                    ),
+                    job_id,
+                    iterations,
                 )
-            except requests.exceptions.RequestException as exc:
-                st.error(f"Failed to reach ML server: {exc}")
-                response = None
+        except requests.exceptions.RequestException as exc:
+            st.error(f"Failed to reach ML server: {exc}")
+            response = None
+        except Exception as exc:  # pylint: disable=broad-except
+            st.error(f"Generation failed: {exc}")
+            response = None
         if response and response.status_code == 200:
             if "application/json" in response.headers.get("Content-Type", ""):
                 payload = response.json()

@@ -15,6 +15,7 @@ import tempfile
 import uuid
 from pathlib import Path
 from typing import Optional, Tuple, List
+import threading
 
 try:
     for _gpu in tf.config.list_physical_devices('GPU'):
@@ -37,6 +38,28 @@ DEFAULT_ITERATIONS = int(os.getenv("HB_STYLE_ITERATIONS", "30"))
 DEFAULT_COLORMAP = os.getenv("HB_STYLE_COLORMAP", "original").lower()
 BASE_IMAGE_FALLBACK = Path("./inputs/base_tshirt.png")
 DESIGNS_ROOT = Path("./designs")
+progress_tracker: dict[str, dict] = {}
+progress_lock = threading.Lock()
+
+
+def _set_progress(job_id: Optional[str], current: int, total: int, loss: Optional[float] = None, status: str = "running"):
+    if not job_id:
+        return
+    with progress_lock:
+        progress_tracker[job_id] = {
+            "current": int(current),
+            "total": int(total),
+            "loss": float(loss) if loss is not None else None,
+            "status": status,
+        }
+
+
+def _clear_progress(job_id: Optional[str]):
+    if not job_id:
+        return
+    with progress_lock:
+        progress_tracker.pop(job_id, None)
+
 DEFAULT_STYLE_WEIGHT = float(os.getenv("HB_STYLE_WEIGHT", "1e-6"))
 DEFAULT_CONTENT_WEIGHT = float(os.getenv("HB_CONTENT_WEIGHT", "2.5e-8"))
 DEFAULT_TV_WEIGHT = float(os.getenv("HB_TV_WEIGHT", "1e-6"))
@@ -183,6 +206,7 @@ def neural_style_transfer(
     content_weight: Optional[float] = None,
     total_variation_weight: Optional[float] = None,
     color_blend_ratio: Optional[float] = None,
+    job_id: Optional[str] = None,
 ) -> Tuple[str, List[str]]:
     total_variation_weight = total_variation_weight if total_variation_weight is not None else DEFAULT_TV_WEIGHT
     style_weight = style_weight if style_weight is not None else DEFAULT_STYLE_WEIGHT
@@ -212,6 +236,10 @@ def neural_style_transfer(
     
     result_path = Path(f"styled_{uuid.uuid4().hex}.png")
 
+    _set_progress(job_id, 0, int(iterations), None, 'running')
+
+    last_loss_value: Optional[float] = None
+
     for i in range(int(iterations)):
         loss, grads = compute_loss_and_grads(
             combination_image,
@@ -228,8 +256,11 @@ def neural_style_transfer(
         )
         grads = tf.clip_by_value(grads, -1.0, 1.0)
         optimizer.apply_gradients([(grads, combination_image)])
+        loss_value = float(loss.numpy())
+        last_loss_value = loss_value
         if i % 10 == 0 or i == iterations - 1:
-            _log(f'Iteration {i+1}/{iterations}: loss={loss:.2f}')
+            _log(f'Iteration {i+1}/{iterations}: loss={loss_value:.2f}')
+        _set_progress(job_id, i + 1, int(iterations), loss_value, 'running')
         if LR_DECAY_EVERY > 0 and (i + 1) % LR_DECAY_EVERY == 0:
             new_lr = float(optimizer.learning_rate.numpy()) * LR_DECAY_RATE
             optimizer.learning_rate.assign(new_lr)
@@ -256,12 +287,23 @@ def neural_style_transfer(
     except OSError:
         pass
 
+    _set_progress(job_id, int(iterations), int(iterations), last_loss_value, 'completed')
+
     return str(output_path), logs
 
 base_image_path = './input_image.png'
 
 app = Flask(__name__)
 CORS(app)
+
+
+@app.route('/progress/<job_id>', methods=['GET'])
+def get_progress(job_id):
+    with progress_lock:
+        data = progress_tracker.get(job_id)
+    if not data:
+        return jsonify({'status': 'unknown'}), 404
+    return jsonify(data)
 
 @app.route('/style_transfer', methods=['POST'])
 def style_transfer():
@@ -276,6 +318,7 @@ def style_transfer():
     tv_weight_val = _as_float(request.form.get('tv_weight'), DEFAULT_TV_WEIGHT)
     color_blend_val = _as_float(request.form.get('color_blend'), DEFAULT_COLOR_BLEND)
     return_logs = _as_bool(request.form.get('return_logs'))
+    request_id = request.form.get('request_id')
 
     temp_design = tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(design.filename or 'design.png')[1])
     temp_design.close()
@@ -302,7 +345,11 @@ def style_transfer():
             content_weight=content_weight_val,
             total_variation_weight=tv_weight_val,
             color_blend_ratio=color_blend_val,
+            job_id=request_id,
         )
+    except Exception:
+        _set_progress(request_id, 0, iterations, None, 'error')
+        raise
     finally:
         os.unlink(temp_design.name)
         if temp_base:
@@ -329,6 +376,7 @@ def generate_style():
     tv_weight_val = _as_float(data.get('tv_weight'), DEFAULT_TV_WEIGHT)
     color_blend_val = _as_float(data.get('color_blend'), DEFAULT_COLOR_BLEND)
     return_logs = _as_bool(data.get('return_logs'))
+    request_id = data.get('request_id')
 
     artform_folder = DESIGNS_ROOT / artform
     if not artform_folder.exists() or not artform_folder.is_dir():
@@ -339,17 +387,22 @@ def generate_style():
         return jsonify({'error': f'No design assets found for artform "{artform}".'}), 400
 
     design_path = random.choice(design_files)
-    output_img, logs = neural_style_transfer(
-        str(BASE_IMAGE_FALLBACK),
-        str(design_path),
-        iterations=iterations,
-        colormap_name=colormap_name,
-        capture_logs=return_logs,
-        style_weight=style_weight_val,
-        content_weight=content_weight_val,
-        total_variation_weight=tv_weight_val,
-        color_blend_ratio=color_blend_val,
-    )
+    try:
+        output_img, logs = neural_style_transfer(
+            str(BASE_IMAGE_FALLBACK),
+            str(design_path),
+            iterations=iterations,
+            colormap_name=colormap_name,
+            capture_logs=return_logs,
+            style_weight=style_weight_val,
+            content_weight=content_weight_val,
+            total_variation_weight=tv_weight_val,
+            color_blend_ratio=color_blend_val,
+            job_id=request_id,
+        )
+    except Exception:
+        _set_progress(request_id, 0, iterations, None, 'error')
+        raise
 
     if return_logs:
         with open(output_img, 'rb') as f:
