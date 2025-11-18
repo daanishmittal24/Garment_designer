@@ -14,7 +14,7 @@ st.set_page_config(page_title="Heritage Buzz Studio", layout="centered")
 
 st.title("🧵 Heritage Buzz – Style Studio")
 st.write(
-    "This lightweight Streamlit UI talks to the existing Flask style-transfer API so you can demo the GenAI pipeline without the React web app."
+    "This lightweight Streamlit UI talks to the Flask style-transfer API for the GenAI pipeline."
 )
 
 # Allow overriding the ML server location without touching code.
